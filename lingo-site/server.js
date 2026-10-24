@@ -32,7 +32,7 @@ const OLLAMA_MODEL = process.env.OLLAMA_MODEL || 'llama3.2';
 // Любой сервис, совместимый с OpenAI (Groq, OpenRouter, Google Gemini, OpenAI и другие)
 const OPENAI_KEY = (process.env.OPENAI_API_KEY || '').trim();
 const OPENAI_URL = (process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1').replace(/\/$/, '');
-const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
+let OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
 const PROVIDER = (process.env.AI_PROVIDER || (ANTHROPIC_KEY ? 'anthropic' : OPENAI_KEY ? 'openai' : 'ollama')).toLowerCase();
 
 /* ---------- База данных ---------- */
@@ -148,6 +148,64 @@ async function ollamaResolve() {
   return { names, model: found || null };
 }
 
+// Каталоги моделей меняются: если выбранной модели у сервиса больше нет, подбираем подходящую сами (для Groq).
+const AUTO_MODEL = process.env.OPENAI_AUTO_MODEL === '1' || (process.env.OPENAI_AUTO_MODEL !== '0' && OPENAI_URL.toLowerCase().includes('groq.com'));
+let modelCheck = { at: 0, result: null };
+
+async function openaiModelIds() {
+  const r = await fetch(OPENAI_URL + '/models', { headers: { authorization: 'Bearer ' + OPENAI_KEY }, signal: AbortSignal.timeout(6000) });
+  if (r.status === 401 || r.status === 403) { const e = new Error('auth'); e.status = r.status; throw e; }
+  if (!r.ok) throw new Error('models ' + r.status);
+  return ((await r.json()).data || []).map((m) => m.id).filter(Boolean);
+}
+
+function pickChatModel(ids) {
+  const bad = /whisper|tts|guard|embed|playai|orpheus|transcri|moderation|safeguard|image|speech/i;
+  const ok = ids.filter((id) => !bad.test(id));
+  const prefs = [/llama-3\.3-70b/i, /gpt-oss-120b/i, /gpt-oss-20b/i, /llama-3\.1-8b/i, /llama/i, /qwen/i, /gemma/i, /mistral|mixtral/i];
+  for (const re of prefs) { const hit = ok.find((id) => re.test(id)); if (hit) return hit; }
+  return ok[0] || null;
+}
+
+// Проверяет, что модель существует у сервиса. Результат кэшируется на 5 минут.
+async function openaiModelStatus() {
+  if (Date.now() - modelCheck.at < 5 * 60 * 1000 && modelCheck.result) return modelCheck.result;
+  let result = { ready: true, provider: 'openai', model: OPENAI_MODEL };
+  try {
+    const ids = await openaiModelIds();
+    if (ids.length && !ids.includes(OPENAI_MODEL)) {
+      const alt = AUTO_MODEL ? pickChatModel(ids) : null;
+      if (alt) {
+        console.log('Модель ' + OPENAI_MODEL + ' недоступна для вашего ключа. Использую: ' + alt + ' (чтобы закрепить, впишите её в OPENAI_MODEL в файле .env)');
+        OPENAI_MODEL = alt;
+        result = { ready: true, provider: 'openai', model: alt };
+      } else {
+        result = { ready: false, provider: 'openai', hint: 'Модель ' + OPENAI_MODEL + ' не найдена у сервиса. Доступны: ' + ids.slice(0, 12).join(', ') + '. Впишите одну из них в OPENAI_MODEL в файле .env.' };
+      }
+    }
+  } catch (e) {
+    if (e.status === 401 || e.status === 403) {
+      result = { ready: false, provider: 'openai', hint: 'Сервис не принял ключ OPENAI_API_KEY (ошибка ' + e.status + '). Создайте новый ключ и впишите его в .env.' };
+    }
+    // если список моделей недоступен, просто пробуем работать с тем, что указано
+  }
+  modelCheck = { at: Date.now(), result };
+  return result;
+}
+
+// Частая ошибка: ключ от одного сервиса, а адрес (OPENAI_BASE_URL) от другого.
+function keyMismatch() {
+  if (PROVIDER !== 'openai' || !OPENAI_KEY) return '';
+  const url = OPENAI_URL.toLowerCase();
+  if (url.includes('groq.com') && !OPENAI_KEY.startsWith('gsk_')) {
+    return 'Адрес указывает на Groq, но ключ не от Groq: ключи Groq начинаются с gsk_ (создайте его на console.groq.com). Либо смените OPENAI_BASE_URL и OPENAI_MODEL под сервис, которому принадлежит ключ.';
+  }
+  if (url.includes('api.openai.com') && OPENAI_KEY.startsWith('gsk_')) {
+    return 'Ключ от Groq (gsk_), а адрес указывает на OpenAI. Укажите OPENAI_BASE_URL=https://api.groq.com/openai/v1 и модель Groq.';
+  }
+  return '';
+}
+
 async function aiStatus() {
   if (PROVIDER === 'anthropic') {
     if (!ANTHROPIC_KEY) return { ready: false, provider: 'anthropic', hint: 'Добавьте ANTHROPIC_API_KEY в файл .env и перезапустите сервер.' };
@@ -155,7 +213,9 @@ async function aiStatus() {
   }
   if (PROVIDER === 'openai') {
     if (!OPENAI_KEY) return { ready: false, provider: 'openai', hint: 'Добавьте OPENAI_API_KEY (и при необходимости OPENAI_BASE_URL и OPENAI_MODEL) в файл .env и перезапустите сервер.' };
-    return { ready: true, provider: 'openai', model: OPENAI_MODEL };
+    const bad = keyMismatch();
+    if (bad) return { ready: false, provider: 'openai', hint: bad };
+    return await openaiModelStatus();
   }
   if (PROVIDER !== 'ollama') {
     return { ready: false, provider: PROVIDER, hint: 'Неизвестное значение AI_PROVIDER в .env. Допустимо: ollama, anthropic, openai.' };
@@ -305,7 +365,7 @@ async function handleTest(req, res) {
   const st = await aiStatus();
   if (!st.ready) return sendJson(res, 200, { ok: false, error: st.hint });
   try {
-    const up = await callUpstream('', [{ role: 'user', content: 'Reply with the single word: OK' }], AbortSignal.timeout(90000), 16);
+    const up = await callUpstream('', [{ role: 'user', content: 'Reply with the single word: OK' }], AbortSignal.timeout(90000), 400);
     if (!up.ok) {
       const detail = (await up.text().catch(() => '')).slice(0, 300);
       return sendJson(res, 200, { ok: false, error: upstreamMessage(up.status), detail });
@@ -315,7 +375,7 @@ async function handleTest(req, res) {
     text = text.trim();
     return sendJson(res, 200, text
       ? { ok: true, provider: st.provider, model: st.model, reply: text }
-      : { ok: false, error: 'Модель вернула пустой ответ. Проверьте название модели в .env.' });
+      : { ok: false, error: 'Модель не вернула текст. Попробуйте ещё раз; если повторяется, выберите другую модель в OPENAI_MODEL (файл .env).' });
   } catch (e) {
     return sendJson(res, 200, { ok: false, error: 'Не удалось связаться с ИИ-сервисом: ' + (e.message || e) });
   }
